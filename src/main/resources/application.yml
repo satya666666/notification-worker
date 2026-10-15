@@ -63,6 +63,9 @@ management:
   endpoint:
     health:
       show-details: always
+  health:
+    mail:
+      enabled: ${NOTIFICATION_MAIL_HEALTH:false}
 
 logging:
   level:
