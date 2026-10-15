@@ -1,0 +1,36 @@
+name: Deploy to Azure Container Apps
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Provision infrastructure
+        id: infra
+        run: |
+          ACR=$(az deployment group create -g "$RESOURCE_GROUP" -f infra/azure/main.bicep \
+            -p dbAdminPassword='${{ secrets.DB_PASSWORD }}' rabbitPassword='${{ secrets.RABBIT_PASSWORD }}' \
+            --query properties.outputs.acrName.value -o tsv)
+          echo "acr=$ACR" >> "$GITHUB_OUTPUT"
+      - name: Build image in ACR
+        run: az acr build -r "${{ steps.infra.outputs.acr }}" -t "notification-worker:${{ github.sha }}" .
+      - name: Deploy image
+        run: |
+          az deployment group create -g "$RESOURCE_GROUP" -f infra/azure/main.bicep \
+            -p dbAdminPassword='${{ secrets.DB_PASSWORD }}' rabbitPassword='${{ secrets.RABBIT_PASSWORD }}' \
+               image="${{ steps.infra.outputs.acr }}.azurecr.io/notification-worker:${{ github.sha }}"

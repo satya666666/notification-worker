@@ -1,14 +1,12 @@
 package com.satyam.notificationworker.service;
 
 import com.satyam.notificationworker.domain.Notification;
-import com.satyam.notificationworker.domain.NotificationStatus;
-import com.satyam.notificationworker.messaging.NotificationMessage;
-import com.satyam.notificationworker.messaging.RabbitConfig;
+import com.satyam.notificationworker.domain.OutboxEvent;
+import com.satyam.notificationworker.metrics.NotificationMetrics;
 import com.satyam.notificationworker.repo.NotificationRepository;
+import com.satyam.notificationworker.repo.OutboxEventRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.amqp.AmqpException;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -20,34 +18,30 @@ public class NotificationService {
     private static final Logger log = LoggerFactory.getLogger(NotificationService.class);
 
     private final NotificationRepository repository;
-    private final RabbitTemplate rabbitTemplate;
+    private final OutboxEventRepository outboxRepository;
+    private final NotificationMetrics metrics;
 
-    public NotificationService(NotificationRepository repository, RabbitTemplate rabbitTemplate) {
+    public NotificationService(
+            NotificationRepository repository,
+            OutboxEventRepository outboxRepository,
+            NotificationMetrics metrics
+    ) {
         this.repository = repository;
-        this.rabbitTemplate = rabbitTemplate;
+        this.outboxRepository = outboxRepository;
+        this.metrics = metrics;
     }
 
     /**
-     * Persist first (repository save commits in its own transaction), then publish.
-     * Publishing inside an open DB transaction races the listener against an uncommitted row.
+     * Persist the job and an outbox row in one transaction. The scheduled
+     * {@code OutboxPublisher} publishes after commit so the listener never
+     * races an uncommitted row, and a broker outage does not lose the job.
      */
+    @Transactional
     public Notification create(String to, String subject, String body) {
         Notification notification = repository.save(new Notification(UUID.randomUUID(), to, subject, body));
-
-        try {
-            rabbitTemplate.convertAndSend(
-                    RabbitConfig.EXCHANGE,
-                    RabbitConfig.ROUTING_KEY,
-                    new NotificationMessage(notification.getId())
-            );
-            log.info("Published notification message id={}", notification.getId());
-        } catch (AmqpException ex) {
-            log.error("Failed to publish notification id={}: {}", notification.getId(), ex.getMessage());
-            notification.setStatus(NotificationStatus.FAILED);
-            notification.setLastError("Broker publish failed: " + ex.getMessage());
-            notification = repository.save(notification);
-        }
-
+        outboxRepository.save(new OutboxEvent(notification.getId()));
+        metrics.incrementCreated();
+        log.info("Queued notification id={} via outbox", notification.getId());
         return notification;
     }
 

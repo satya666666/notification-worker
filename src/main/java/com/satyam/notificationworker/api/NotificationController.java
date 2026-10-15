@@ -3,6 +3,7 @@ package com.satyam.notificationworker.api;
 import com.satyam.notificationworker.domain.Notification;
 import com.satyam.notificationworker.service.NotificationService;
 import jakarta.validation.Valid;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -16,6 +17,7 @@ import java.util.UUID;
 
 @RestController
 @RequestMapping("/notifications")
+@ConditionalOnProperty(name = "notification.roles.api", havingValue = "true", matchIfMissing = true)
 public class NotificationController {
 
     private final NotificationService notificationService;

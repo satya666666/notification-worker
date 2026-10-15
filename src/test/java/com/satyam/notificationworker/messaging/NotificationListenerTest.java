@@ -4,7 +4,9 @@ import com.satyam.notificationworker.config.NotificationProperties;
 import com.satyam.notificationworker.domain.Notification;
 import com.satyam.notificationworker.domain.NotificationStatus;
 import com.satyam.notificationworker.email.EmailSender;
+import com.satyam.notificationworker.metrics.NotificationMetrics;
 import com.satyam.notificationworker.repo.NotificationRepository;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -12,6 +14,8 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.amqp.AmqpRejectAndDontRequeueException;
+import org.springframework.amqp.core.MessagePostProcessor;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 
 import java.util.Optional;
 import java.util.UUID;
@@ -19,6 +23,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -34,6 +39,9 @@ class NotificationListenerTest {
     @Mock
     private EmailSender emailSender;
 
+    @Mock
+    private RabbitTemplate rabbitTemplate;
+
     private NotificationProperties properties;
     private NotificationListener listener;
 
@@ -41,7 +49,13 @@ class NotificationListenerTest {
     void setUp() {
         properties = new NotificationProperties();
         properties.setMaxAttempts(3);
-        listener = new NotificationListener(repository, emailSender, properties);
+        listener = new NotificationListener(
+                repository,
+                emailSender,
+                properties,
+                rabbitTemplate,
+                new NotificationMetrics(new SimpleMeterRegistry())
+        );
     }
 
     @Test
@@ -89,16 +103,14 @@ class NotificationListenerTest {
     }
 
     @Test
-    void requeuesWhenAttemptsRemain() {
+    void schedulesDelayedRetryWhenAttemptsRemain() {
         UUID id = UUID.randomUUID();
         Notification notification = new Notification(id, "a@b.com", "Hi", "Body");
         when(repository.findById(id)).thenReturn(Optional.of(notification));
         when(repository.save(any(Notification.class))).thenAnswer(inv -> inv.getArgument(0));
         doThrow(new RuntimeException("smtp down")).when(emailSender).send(any(), any(), any());
 
-        assertThatThrownBy(() -> listener.onMessage(new NotificationMessage(id)))
-                .isInstanceOf(RuntimeException.class)
-                .isNotInstanceOf(AmqpRejectAndDontRequeueException.class);
+        listener.onMessage(new NotificationMessage(id));
 
         ArgumentCaptor<Notification> captor = ArgumentCaptor.forClass(Notification.class);
         verify(repository, times(2)).save(captor.capture());
@@ -106,6 +118,13 @@ class NotificationListenerTest {
         assertThat(afterFailure.getStatus()).isEqualTo(NotificationStatus.PROCESSING);
         assertThat(afterFailure.getAttempts()).isEqualTo(1);
         assertThat(afterFailure.getLastError()).contains("smtp down");
+
+        verify(rabbitTemplate).convertAndSend(
+                eq(RabbitConfig.RETRY_EXCHANGE),
+                eq(RabbitConfig.RETRY_ROUTING_KEY),
+                eq(new NotificationMessage(id)),
+                any(MessagePostProcessor.class)
+        );
     }
 
     @Test
@@ -126,6 +145,12 @@ class NotificationListenerTest {
         assertThat(failed.getStatus()).isEqualTo(NotificationStatus.FAILED);
         assertThat(failed.getAttempts()).isEqualTo(3);
         assertThat(failed.getLastError()).contains("smtp down");
+        verify(rabbitTemplate, never()).convertAndSend(
+                eq(RabbitConfig.RETRY_EXCHANGE),
+                eq(RabbitConfig.RETRY_ROUTING_KEY),
+                any(),
+                any(MessagePostProcessor.class)
+        );
     }
 
     @Test

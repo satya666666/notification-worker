@@ -47,6 +47,9 @@ class NotificationIntegrationTest {
     static void notificationProps(DynamicPropertyRegistry registry) {
         registry.add("notification.max-attempts", () -> "3");
         registry.add("notification.email.provider", () -> "logging");
+        registry.add("notification.retry.initial-backoff-ms", () -> "50");
+        registry.add("notification.retry.multiplier", () -> "1");
+        registry.add("notification.outbox.poll-interval-ms", () -> "50");
     }
 
     @Test
@@ -137,6 +140,13 @@ class NotificationIntegrationTest {
                 String.class
         );
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void healthEndpointIsUp() {
+        ResponseEntity<String> response = restTemplate.getForEntity("/actuator/health", String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("UP");
     }
 
     @Test

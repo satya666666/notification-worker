@@ -41,9 +41,28 @@ spring:
 
 notification:
   max-attempts: ${NOTIFICATION_MAX_ATTEMPTS:3}
+  retry:
+    initial-backoff-ms: ${NOTIFICATION_RETRY_INITIAL_MS:1000}
+    multiplier: ${NOTIFICATION_RETRY_MULTIPLIER:2.0}
+    max-backoff-ms: ${NOTIFICATION_RETRY_MAX_MS:30000}
+  roles:
+    api: ${NOTIFICATION_ROLE_API:true}
+    worker: ${NOTIFICATION_ROLE_WORKER:true}
+  outbox:
+    poll-interval-ms: ${NOTIFICATION_OUTBOX_POLL_MS:200}
+    batch-size: ${NOTIFICATION_OUTBOX_BATCH_SIZE:50}
   email:
     provider: ${NOTIFICATION_EMAIL_PROVIDER:logging}
     from: ${NOTIFICATION_EMAIL_FROM:noreply@example.com}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
 
 logging:
   level:

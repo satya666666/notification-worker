@@ -2,26 +2,29 @@
 
 **Project:** `notification-worker`  
 **Package:** `com.satyam.notificationworker`  
-**Date:** 2026-08-10 (MVP)  
+**Date:** 2026-08-18 (MVP + outbox / backoff / split / metrics)  
 **Related docs:** [Design Spec](superpowers/specs/2026-08-10-notification-worker-design.md) · [Implementation Plan](superpowers/plans/2026-08-10-notification-worker.md) · [README](../README.md)
 
 ---
 
 ## 1. What this project is
 
-**Notification Worker** is a small backend service that accepts an email-notification job over HTTP, stores it in **PostgreSQL**, puts a lightweight message on **RabbitMQ**, and has a background **listener** in the same process that actually “sends” the email and updates status.
+**Notification Worker** is a backend service that accepts an email-notification job over HTTP, stores it in **PostgreSQL** with a **transactional outbox**, publishes a lightweight message to **RabbitMQ**, and has a **worker listener** (same JAR, optional separate process) that sends the email and updates status.
 
 It is built as a **resume / interview showcase** project. The point is not fancy email templates — it is to demonstrate real backend concepts:
 
 | Concept | How this project shows it |
 |---|---|
 | Async processing | HTTP returns quickly; work happens on a queue |
-| Message queues | RabbitMQ exchange + queue |
+| Transactional outbox | Job + outbox row in one TX; poller publishes after commit |
+| Message queues | RabbitMQ exchange + queue + retry TTL queue |
 | Durability / status tracking | Postgres row is source of truth |
 | At-least-once delivery | Messages can be redelivered |
 | Idempotency | Already `SENT` / `FAILED` → no double-send |
-| Retries | Transient email failures requeue up to N times |
+| Delayed retries | Transient failures wait with exponential backoff |
 | Dead Letter Queue (DLQ) | Exhausted failures land on `notifications.send.dlq` |
+| Split deployables | Same JAR; `api` vs `worker` roles |
+| Metrics | Actuator + Micrometer `notifications.*` counters |
 | Swappable integrations | `EmailSender` = logging (default) or SMTP |
 
 **One-liner for interviews:**  
@@ -70,7 +73,8 @@ Clients can poll `GET /notifications/{id}` for status instead of waiting on SMTP
 | Database | PostgreSQL | **15** (Compose) |
 | Messaging | Spring AMQP / RabbitMQ | **3-management** (Compose) |
 | Email | Spring Mail | Optional; logging by default |
-| Local deps | Docker Compose | Postgres + RabbitMQ only |
+| Local deps | Docker Compose | Postgres + RabbitMQ + optional API/worker images |
+| Observability | Spring Boot Actuator | `/actuator/health`, `/actuator/metrics` |
 | Tests | JUnit 5, Mockito, Testcontainers | **1.20.6** |
 
 Artifact coordinates: `com.satyam:notification-worker:0.0.1-SNAPSHOT`
@@ -79,27 +83,33 @@ Artifact coordinates: `com.satyam:notification-worker:0.0.1-SNAPSHOT`
 
 ## 4. High-level architecture
 
-**Single deployable process** hosts both:
+The same JAR can run **both roles** (local Maven) or **split** into API + worker containers:
 
-1. REST API (accept + query jobs)
+1. REST API + outbox publisher (accept + query jobs, publish after commit)
 2. RabbitMQ listener (process jobs)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                 Spring Boot process (port 8080)             │
-│                                                             │
+┌──────────────────────── API (8080) ─────────────────────────┐
 │  NotificationController                                     │
 │           │                                                 │
 │           ▼                                                 │
 │  NotificationService                                        │
-│     ├─ save PENDING ───────────────────────▶ PostgreSQL     │
-│     └─ publish { notificationId } ─────────▶ RabbitMQ       │
+│     └─ save PENDING + outbox row ──────────▶ PostgreSQL     │
 │                                                             │
-│  NotificationListener ◀── consume notifications.send        │
+│  OutboxPublisher (scheduled)                                │
+│     └─ publish { notificationId } ─────────▶ RabbitMQ       │
+└─────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+              notifications.send queue
+                         │
+                         ▼
+┌────────────────────── Worker (8081) ────────────────────────┐
+│  NotificationListener                                       │
 │     ├─ load row / skip if SENT|FAILED                       │
 │     ├─ PROCESSING + attempts++                              │
 │     ├─ EmailSender.send(...)                                │
-│     └─ SENT  or  retry  or  FAILED → DLQ                    │
+│     └─ SENT  or  delayed retry  or  FAILED → DLQ            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -117,9 +127,10 @@ sequenceDiagram
 
   Client->>API: POST /notifications
   API->>Svc: create(to, subject, body)
-  Svc->>DB: INSERT status=PENDING
-  Svc->>Q: publish { notificationId }
+  Svc->>DB: INSERT PENDING + outbox row
   API-->>Client: 202 { id, PENDING }
+  Note over Svc,Q: OutboxPublisher (after commit)
+  Svc->>Q: publish { notificationId }
 
   Q->>L: deliver message
   L->>DB: load row
@@ -129,7 +140,7 @@ sequenceDiagram
     L->>DB: SENT + sentAt
   else attempts less than max
     L->>DB: lastError
-    L-->>Q: nack / requeue
+    L-->>Q: retry queue (TTL backoff)
   else exhausted
     L->>DB: FAILED
     L-->>Q: reject → DLQ
@@ -140,13 +151,16 @@ sequenceDiagram
   API-->>Client: 200 status JSON
 ```
 
-### Important design choice: persist, then publish
+### Important design choice: transactional outbox
 
-`NotificationService` saves the row **first** (committed), then publishes to RabbitMQ.
+`NotificationService.create` writes the notification row **and** an `notification_outbox` row in **one database transaction**. A scheduled `OutboxPublisher` (API role) then publishes `{ notificationId }` and marks the outbox row published.
 
-Why: if publish happened inside an open DB transaction, the listener could load the id **before** the insert was visible → “notification not found” → DLQ by mistake.
+Why not publish inside the HTTP request:
 
-If publish fails after insert, the row is marked `FAILED` with a clear `lastError` (honest MVP behavior; a production system might use a **transactional outbox** instead).
+- Publishing inside an open DB transaction races the listener against an uncommitted row.
+- Publishing after commit without an outbox can lose the job if RabbitMQ is down.
+
+If the broker is down, the row stays `PENDING` and the poller retries until publish succeeds. Duplicate publishes are safe because the listener is idempotent.
 
 ---
 
@@ -155,7 +169,9 @@ If publish fails after insert, the row is marked `FAILED` with a clear `lastErro
 ```
 notification-worker/
 ├── pom.xml
-├── docker-compose.yml          # Postgres + RabbitMQ
+├── Dockerfile                  # Multi-stage Maven → JRE image
+├── docker-compose.yml          # Postgres + RabbitMQ + api + worker
+├── .github/workflows/ci.yml    # mvn test on push/PR
 ├── README.md                   # Quick start
 ├── docs/
 │   ├── PROJECT-OVERVIEW.md     # This document
@@ -171,11 +187,12 @@ notification-worker/
     │   │   ├── domain/         # Entity + status enum
     │   │   ├── repo/           # Spring Data repository
     │   │   ├── service/        # Business orchestration
-    │   │   ├── messaging/      # RabbitMQ topology + listener
+    │   │   ├── messaging/      # RabbitMQ topology, outbox publisher, listener
+    │   │   ├── metrics/        # Micrometer counters
     │   │   └── email/          # EmailSender implementations
     │   └── resources/
     │       ├── application.yml
-    │       └── db/migration/V1__notification.sql
+    │       └── db/migration/V1__notification.sql, V2__outbox.sql
     └── test/java/...           # Unit + Testcontainers integration tests
 ```
 
@@ -197,7 +214,7 @@ notification-worker/
 
 | Class | Role |
 |---|---|
-| `NotificationService` | Persist job, publish message, load by id |
+| `NotificationService` | Persist job + outbox row, load by id |
 | `NotificationNotFoundException` | Thrown when GET id does not exist |
 
 ### 6.3 `domain` + `repo` — persistence
@@ -205,16 +222,19 @@ notification-worker/
 | Class | Role |
 |---|---|
 | `Notification` | JPA entity mapped to table `notification` |
+| `OutboxEvent` | JPA entity mapped to table `notification_outbox` |
 | `NotificationStatus` | Enum: `PENDING`, `PROCESSING`, `SENT`, `FAILED` |
 | `NotificationRepository` | `JpaRepository<Notification, UUID>` |
+| `OutboxEventRepository` | Unpublished outbox poll with pessimistic lock |
 
 ### 6.4 `messaging` — RabbitMQ
 
 | Class | Role |
 |---|---|
-| `RabbitConfig` | Declares exchange, queue, DLX, DLQ, bindings, JSON converter |
+| `RabbitConfig` | Declares exchange, queue, retry queue, DLX, DLQ, bindings |
 | `NotificationMessage` | Tiny payload: `{ notificationId }` |
-| `NotificationListener` | Consumes queue; send + retry + idempotency + DLQ |
+| `OutboxPublisher` | Scheduled poller; publishes unpublished outbox rows |
+| `NotificationListener` | Consumes queue; send + delayed retry + idempotency + DLQ |
 
 ### 6.5 `email` — delivery
 
@@ -230,13 +250,19 @@ notification-worker/
 
 | Class | Role |
 |---|---|
-| `NotificationProperties` | `notification.max-attempts`, `notification.email.*` |
+| `NotificationProperties` | max-attempts, retry backoff, roles, outbox, email |
+
+### 6.7 `metrics`
+
+| Class | Role |
+|---|---|
+| `NotificationMetrics` | Counters: created, published, sent, failed, retried |
 
 ---
 
 ## 7. Data model (Postgres)
 
-Flyway migration: `src/main/resources/db/migration/V1__notification.sql`  
+Flyway migrations: `V1__notification.sql`, `V2__outbox.sql`  
 JPA setting: `ddl-auto: validate` (Hibernate does **not** create tables; Flyway owns schema).
 
 ### Table `notification`
@@ -256,6 +282,17 @@ JPA setting: `ddl-auto: validate` (Hibernate does **not** create tables; Flyway 
 
 Index: `idx_notification_status` on `status`.
 
+### Table `notification_outbox`
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | UUID PK | Outbox event id |
+| `notification_id` | UUID FK | Job to publish |
+| `created_at` | TIMESTAMPTZ | Inserted with the job |
+| `published_at` | TIMESTAMPTZ | Set after RabbitMQ publish succeeds |
+
+Partial index `idx_outbox_unpublished` on `created_at` where `published_at IS NULL`.
+
 ### Status lifecycle
 
 ```
@@ -265,9 +302,9 @@ PENDING ──▶ PROCESSING ──▶ SENT
 ```
 
 - `PENDING` — saved, waiting for worker (or just published)
-- `PROCESSING` — listener picked it up; may requeue while still under max attempts
+- `PROCESSING` — listener picked it up; may delay-retry while still under max attempts
 - `SENT` — terminal success
-- `FAILED` — terminal failure (publish failed or email retries exhausted)
+- `FAILED` — terminal failure (email retries exhausted)
 
 ---
 
@@ -305,7 +342,7 @@ There is **no homepage** at `/`. Opening the root URL shows Spring’s Whitelabe
 
 **Invalid body — `400`**
 
-**Note:** If the DB insert succeeds but RabbitMQ publish fails, the service marks the row `FAILED`. The controller still returns `202` with whatever status the service returned (usually `FAILED` in that edge case).
+**Note:** Publish happens from the outbox after commit. A broker outage leaves the job `PENDING` until the poller succeeds.
 
 ### `GET /notifications/{id}`
 
@@ -341,6 +378,9 @@ Configured in `RabbitConfig`.
 | Dead-letter exchange | `notifications.dlx` (direct) |
 | DLQ routing key | `send.dlq` |
 | Dead-letter queue | `notifications.send.dlq` |
+| Retry exchange | `notifications.retry` (direct) |
+| Retry routing key | `send.retry` |
+| Retry queue | `notifications.send.retry` (per-message TTL → main exchange) |
 
 **Message body (only):**
 
@@ -375,7 +415,7 @@ Implemented in `NotificationListener` with `notification.max-attempts` (default 
 6. **On success** → `SENT`, set `sentAt`, clear `lastError`
 7. **On failure**
    - Save `lastError`
-   - If `attempts < maxAttempts` → throw runtime exception → message **requeues**
+   - If `attempts < maxAttempts` → publish to the **retry queue** with per-message TTL (exponential backoff), then **ack**
    - If exhausted → set `FAILED` → throw `AmqpRejectAndDontRequeueException` → RabbitMQ routes to **DLQ**
 
 ### Mental model
@@ -383,12 +423,12 @@ Implemented in `NotificationListener` with `notification.max-attempts` (default 
 | Outcome | DB status | Queue action |
 |---|---|---|
 | First success | `SENT` | Ack |
-| Transient fail (attempt 1 or 2) | `PROCESSING` + `lastError` | Requeue |
+| Transient fail (attempt 1 or 2) | `PROCESSING` + `lastError` | Retry queue with TTL, then back to `send` |
 | Fail on attempt 3 | `FAILED` | Reject → DLQ |
 | Redeliver after `SENT` | unchanged | Ack / skip send |
 | Unknown id | n/a | Reject → DLQ |
 
-Retries are counted in the **database** (`attempts`), not via RabbitMQ retry plugins. There is **no delay/backoff** in the MVP (immediate requeue).
+Retries are counted in the **database** (`attempts`). Backoff is `initial * multiplier^(attempt-1)`, capped at `max-backoff-ms` (default 1s, 2s, 4s…).
 
 ---
 
@@ -430,14 +470,16 @@ mvn spring-boot:run
 
 ### Docker Compose (`docker-compose.yml`)
 
-| Service | Image | Host ports | Credentials |
+| Service | Image | Host ports | Credentials / role |
 |---|---|---|---|
 | Postgres | `postgres:15` | **5433** → 5432 | db/user/pass = `notification` |
 | RabbitMQ | `rabbitmq:3-management` | **5672**, **15672** | `guest` / `guest` |
+| `api` | local Dockerfile | **8080** | API + outbox publisher |
+| `worker` | local Dockerfile | **8081** → 8080 | Listener only |
 
 Postgres uses **5433** on the host so it does not clash with a local Postgres on 5432.
 
-The **app itself is not containerized** in MVP — you run it with Maven.
+`docker compose up --build` starts the full stack. For local Maven, start only `postgres` and `rabbitmq` (both roles stay enabled in the single process).
 
 ### Key `application.yml` settings
 
@@ -447,6 +489,8 @@ The **app itself is not containerized** in MVP — you run it with Maven.
 | DB URL | `localhost:5433` / database `notification` |
 | RabbitMQ | `localhost:5672`, guest/guest |
 | `notification.max-attempts` | `3` |
+| `notification.retry.initial-backoff-ms` | `1000` |
+| `notification.roles.api` / `worker` | `true` / `true` |
 | `notification.email.provider` | `logging` |
 
 ---
@@ -458,16 +502,17 @@ The **app itself is not containerized** in MVP — you run it with Maven.
 - **JDK 21** (not 25+)
 - Docker Desktop running
 
-### Start dependencies
+### Full stack
 
 ```bash
 cd /Users/satyamgupta/IdeaProjects/notification-worker
-docker compose up -d
+docker compose up --build
 ```
 
-### Start the app
+### Or local Maven (single process)
 
 ```bash
+docker compose up -d postgres rabbitmq
 export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 mvn spring-boot:run
 ```
@@ -498,9 +543,10 @@ Within about a second (logging provider), expect `"status":"SENT"`.
 
 ### What you should see in logs
 
-1. `Published notification message id=...`
-2. `Email sent (logging provider): to=a@b.com, subject=Hi, body=Hello`
-3. `Notification sent id=... attempts=1`
+1. `Queued notification id=... via outbox`
+2. `Published outbox event id=...`
+3. `Email sent (logging provider): to=a@b.com, subject=Hi, body=Hello`
+4. `Notification sent id=... attempts=1`
 
 ### Optional checks in RabbitMQ UI
 
@@ -519,13 +565,15 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 mvn test
 ```
 
-Expect **14 tests**, `BUILD SUCCESS`. No real SMTP required.
+Expect **18 tests**, `BUILD SUCCESS`. No real SMTP required.
 
 | Test class | Type | What it covers |
 |---|---|---|
-| `NotificationListenerTest` | Unit (Mockito) | Idempotent skip, success, requeue, exhausted → DLQ, missing row |
-| `NotificationServiceTest` | Unit (Mockito) | Persist+publish, publish failure → `FAILED`, not-found |
-| `NotificationIntegrationTest` | Integration (Testcontainers) | Happy path → `SENT`, retries+DLQ, idempotent redelivery, 400/404 |
+| `NotificationListenerTest` | Unit (Mockito) | Idempotent skip, success, delayed retry, exhausted → DLQ, missing row |
+| `NotificationServiceTest` | Unit (Mockito) | Persist + outbox write, not-found |
+| `OutboxPublisherTest` | Unit (Mockito) | Publish + mark; broker failure leaves unpublished |
+| `NotificationPropertiesTest` | Unit | Exponential backoff + cap |
+| `NotificationIntegrationTest` | Integration (Testcontainers) | Happy path → `SENT`, retries+DLQ, idempotent redelivery, 400/404, health |
 
 Testcontainers spins up real Postgres + RabbitMQ containers for integration tests. Surefire is configured with Docker API **1.44** for Docker Engine 29+.
 
@@ -533,24 +581,15 @@ Testcontainers spins up real Postgres + RabbitMQ containers for integration test
 
 ## 15. What is intentionally out of scope (MVP)
 
-These are deliberate omissions — good **v2 / interview talking points**:
+These are still good **interview talking points** for what you would build next:
 
 1. Auth / multi-tenant APIs  
-2. Transactional outbox (stronger publish reliability)  
-3. Email templates, attachments, SMS/push  
-4. Separate API vs worker deployables / autoscaling story  
-5. Admin UI, cron/scheduling, priority or delayed queues  
-6. Full metrics / tracing stack (basic logging only)
+2. Email templates, attachments, SMS/push  
+3. Admin UI, cron/scheduling, priority queues  
+4. Distributed tracing / Prometheus scrape
+5. Real provider (SES/SendGrid) + delivery webhooks
 
-### Natural next upgrades
-
-| Upgrade | Why |
-|---|---|
-| Split API and worker | Scale consumers independently |
-| Outbox pattern | Avoid “saved but not published” dual-write risk |
-| Delayed retries | Backoff instead of immediate requeue |
-| Metrics | Queue depth, send latency, failure rate |
-| Real provider (SES/SendGrid) | Production delivery + webhooks |
+Outbox, delayed retries, API/worker split, Actuator metrics, Docker, and CI are implemented.
 
 ---
 
@@ -566,22 +605,27 @@ A: DB is source of truth. Listener always loads current content and status. Supp
 A: Before sending, if status is already `SENT` or `FAILED`, the listener no-ops. That makes at-least-once delivery safe for terminal states.
 
 **Q: What happens when email keeps failing?**  
-A: Each failure increments `attempts`. Under max → requeue. At max → mark `FAILED` and reject to DLQ for inspection.
+A: Each failure increments `attempts`. Under max → publish to a TTL retry queue (exponential backoff). At max → mark `FAILED` and reject to DLQ for inspection.
 
-**Q: What is still imperfect in MVP?**  
-A: Persist-then-publish is not atomic (no outbox). Retries have no backoff. API and worker share one process.
+**Q: How do you avoid “saved but never published”?**  
+A: The job and outbox row commit together. A poller publishes after commit and retries if the broker is down. The listener is idempotent if a publish is duplicated.
+
+**Q: How do you run API and worker separately?**  
+A: Same JAR. `NOTIFICATION_ROLE_API` / `NOTIFICATION_ROLE_WORKER` toggle the controller+publisher vs the listener. Compose runs two containers.
 
 ---
 
 ## 17. Success checklist (MVP done when)
 
-- [x] `docker compose up -d` starts Postgres + RabbitMQ  
+- [x] `docker compose up --build` starts Postgres, RabbitMQ, API, and worker  
 - [x] `POST /notifications` returns `202` with `PENDING`  
-- [x] Worker processes message; `GET` shows `SENT` with logging provider  
-- [x] Forced failures exhaust retries → `FAILED` + DLQ  
+- [x] Outbox poller publishes after commit; `GET` shows `SENT` with logging provider  
+- [x] Forced failures exhaust retries (with backoff) → `FAILED` + DLQ  
 - [x] Re-delivery after `SENT` does not double-send  
-- [x] README documents run + logging vs SMTP  
+- [x] Actuator health/metrics available  
+- [x] README documents run + logging vs SMTP + roles  
 - [x] Tests pass without a real SMTP server  
+- [x] GitHub Actions CI runs `mvn test`  
 
 ---
 
@@ -595,7 +639,9 @@ A: Persist-then-publish is not atomic (no outbox). Retries have no backoff. API 
 | Postgres | localhost:**5433**, user/pass/db `notification` |
 | RabbitMQ AMQP | localhost:**5672**, guest/guest |
 | RabbitMQ UI | http://localhost:15672 |
+| Worker health | http://localhost:8081/actuator/health (Compose) |
 | Work queue | `notifications.send` |
+| Retry queue | `notifications.send.retry` |
 | DLQ | `notifications.send.dlq` |
 | Default email mode | `logging` (log only, no real mail) |
 | Max attempts | `3` |
